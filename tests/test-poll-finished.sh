@@ -117,9 +117,51 @@ test_working_remains_non_terminal() {
   printf 'ok - running/working remains non-terminal\n'
 }
 
+# v1 (personal keys) leaves status_detail unset and reports the state in
+# status_enum, keeping status=running while Devin waits.
+test_v1_blocked_is_terminal() {
+  run_poll '{"status":"running","status_detail":null,"status_enum":"blocked","title":"v1 session","pull_request":{"url":"https://github.com/o/r/pull/1"}}'
+
+  assert_eq 0 "$RUN_RC" "v1 running/blocked should exit successfully"
+  assert_eq 1 "$(read_count "$CURL_COUNT_FILE")" "v1 running/blocked should make one request"
+  assert_eq 0 "$(read_count "$SLEEP_COUNT_FILE")" "v1 running/blocked should not sleep"
+  assert_contains "$RUN_OUTPUT" "Session finished: status=running (blocked)" "v1 running/blocked should print the terminal summary"
+  assert_contains "$RUN_OUTPUT" "PR: https://github.com/o/r/pull/1" "v1 should print the PR URL"
+  printf 'ok - v1 running/blocked is terminal\n'
+}
+
+test_v1_finished_is_terminal() {
+  run_poll '{"status":"running","status_enum":"finished","title":"v1 session"}'
+
+  assert_eq 0 "$RUN_RC" "v1 running/finished should exit successfully"
+  assert_eq 0 "$(read_count "$SLEEP_COUNT_FILE")" "v1 running/finished should not sleep"
+  printf 'ok - v1 running/finished is terminal\n'
+}
+
+test_v1_expired_is_failure() {
+  run_poll '{"status":"running","status_enum":"expired","title":"v1 session"}'
+
+  assert_eq 1 "$RUN_RC" "v1 expired should be a failure"
+  assert_eq 0 "$(read_count "$SLEEP_COUNT_FILE")" "v1 expired should not sleep"
+  printf 'ok - v1 expired is a failure\n'
+}
+
+test_v1_working_remains_non_terminal() {
+  run_poll '{"status":"running","status_enum":"working","title":"v1 session"}'
+
+  assert_eq 99 "$RUN_RC" "v1 running/working should continue to sleep"
+  assert_eq 1 "$(read_count "$SLEEP_COUNT_FILE")" "v1 running/working should invoke sleep"
+  assert_not_contains "$RUN_OUTPUT" "Session finished:" "v1 running/working should not print the terminal summary"
+  printf 'ok - v1 running/working remains non-terminal\n'
+}
+
 test_finished_is_terminal
 test_waiting_for_user_remains_terminal
 test_failure_status_takes_precedence
 test_working_remains_non_terminal
+test_v1_blocked_is_terminal
+test_v1_finished_is_terminal
+test_v1_expired_is_failure
+test_v1_working_remains_non_terminal
 
 printf 'all poll terminal-state tests passed\n'

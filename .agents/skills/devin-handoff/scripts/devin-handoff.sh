@@ -265,20 +265,22 @@ cmd_poll() {
     body=$(api_request GET "$base/sessions/$session_id")
     status=$(echo "$body" | jq -r '.status // "unknown"')
 
-    # v3 returns status_detail, v1 returns just status
-    status_detail=$(echo "$body" | jq -r '.status_detail // empty')
+    # v3 reports the detailed state in status_detail; v1 leaves that unset and
+    # uses status_enum instead (status stays "running" while Devin is idle)
+    status_detail=$(echo "$body" | jq -r '.status_detail // .status_enum // empty')
 
     echo "[$(date +%H:%M:%S)] status=$status${status_detail:+ detail=$status_detail}" >&2
 
-    # Terminal conditions. Top-level failure states take precedence over status
-    # details. waiting_for_user and finished both mean Devin has stopped working;
-    # for a handoff they count as done, so stop polling instead of waiting for the
-    # VM to exit or suspend.
+    # Terminal conditions. Failure states take precedence. waiting_for_user (v3),
+    # blocked (v1) and finished all mean Devin has stopped working; for a handoff
+    # they count as done, so stop polling instead of waiting for the VM to exit
+    # or suspend.
     local terminal_rc=""
-    if [[ "$status" == "error" || "$status" == "suspended" ]]; then
+    if [[ "$status" == "error" || "$status" == "suspended" \
+          || "$status_detail" == "expired" || "$status_detail" == suspend_requested* ]]; then
       terminal_rc=1
     elif [[ "$status" == "exit" || "$status_detail" == "waiting_for_user" \
-            || "$status_detail" == "finished" ]]; then
+            || "$status_detail" == "blocked" || "$status_detail" == "finished" ]]; then
       terminal_rc=0
     fi
 
