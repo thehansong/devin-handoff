@@ -36,6 +36,10 @@ scripts/devin-handoff.sh create \
   --context "<what you've found so far>"
 ```
 
+Local work (unpushed commits, uncommitted changes, untracked files) is
+uploaded as a `.patch` attachment automatically. Add `--attach FILE` for
+screenshots, PDFs or logs, or `--no-diff` to send no local changes.
+
 4. Share the session URL with the user
 5. To wait for completion, poll until Devin finishes:
 

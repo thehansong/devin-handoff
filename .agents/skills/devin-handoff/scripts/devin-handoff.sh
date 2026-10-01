@@ -3,7 +3,7 @@
 # devin-handoff.sh — Hand off a task to a cloud Devin session.
 #
 # Usage:
-#   devin-handoff.sh create --task TASK [--context CONTEXT] [--tag TAG] [--api-url URL]
+#   devin-handoff.sh create --task TASK [--context CONTEXT] [--tag TAG] [--attach FILE] [--api-url URL]
 #   devin-handoff.sh poll SESSION_ID [--interval SECS] [--api-url URL]
 #   devin-handoff.sh archive SESSION_ID [--api-url URL] [--org-id ORG]
 #   devin-handoff.sh --help
@@ -15,14 +15,19 @@
 set -euo pipefail
 
 readonly VERSION="1.4.0"
-readonly MAX_DIFF_BYTES=102400  # 100KB
+readonly MAX_DIFF_BYTES=102400      # 100KB, inline diff fallback
+readonly MAX_PATCH_BYTES=10485760   # 10MB, uploaded patch
 readonly DEFAULT_POLL_INTERVAL=30
+
+PATCH_DIR=""  # temp dir for the uploaded patch; removed on exit
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 die() { echo "error: $*" >&2; exit 1; }
+
+cleanup() { [[ -z "$PATCH_DIR" ]] || rm -rf "$PATCH_DIR"; }
 
 usage() {
   cat <<EOF
@@ -40,9 +45,17 @@ create options:
   --task      Task description for Devin (required)
   --context   Additional context (files examined, findings, partial fixes)
   --tag       Extra tag (in addition to the default "handoff" tag)
+  --attach    Upload a file (image, PDF, log, ...) for Devin; repeatable
+  --no-diff   Don't send any local changes
+  --inline-diff
+              Send uncommitted changes inline in the prompt (git diff HEAD,
+              100KB max) instead of uploading a patch
   --api-url   Devin API base URL (default: https://api.devin.ai)
   --org-id    Organization ID (required for service keys)
   --user-id   Create session as this user (service keys only)
+
+  By default, local work (unpushed commits, uncommitted changes and untracked,
+  non-ignored files) is uploaded as a .patch attachment Devin can git apply.
 
 poll options:
   --interval  Polling interval in seconds (default: 30)
@@ -69,6 +82,8 @@ Examples:
   devin-handoff.sh create \\
     --task "Add rate limiting to /api/users" \\
     --context "Investigated src/api/users.py. No rate limiting exists."
+
+  devin-handoff.sh create --task "Match this mockup" --attach mockup.png
 
   devin-handoff.sh poll devin-abc123 --interval 15
 
@@ -133,7 +148,59 @@ get_branch() {
 }
 
 get_diff() {
-  git diff HEAD 2>/dev/null | head -c "$MAX_DIFF_BYTES" || echo ""
+  local diff
+  diff=$(git diff HEAD 2>/dev/null | head -c "$((MAX_DIFF_BYTES + 1))") || true
+  if (( $(printf '%s' "$diff" | wc -c) > MAX_DIFF_BYTES )); then
+    diff=$(printf '%s' "$diff" | head -c "$MAX_DIFF_BYTES")
+    diff+=$'\n'"[diff truncated at $((MAX_DIFF_BYTES / 1024))KB]"
+  fi
+  printf '%s' "$diff"
+}
+
+# The newest commit Devin can see: where HEAD meets its upstream, or the
+# remote's default branch when the branch was never pushed. Falls back to HEAD.
+get_base_commit() {
+  local upstream default_ref
+  if upstream=$(git rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null); then
+    git merge-base HEAD "$upstream" 2>/dev/null && return 0
+  fi
+  if default_ref=$(git symbolic-ref -q refs/remotes/origin/HEAD 2>/dev/null); then
+    git merge-base HEAD "$default_ref" 2>/dev/null && return 0
+  fi
+  git rev-parse HEAD 2>/dev/null
+}
+
+# Write a binary-safe patch from BASE to the working tree, including untracked
+# (non-ignored) files. Stages into a temporary index so the user's index is
+# left untouched. Returns non-zero if there are no changes.
+build_patch() {
+  local base="$1" out="$2" real_index tmp_index
+  real_index=$(git rev-parse --git-path index)
+  tmp_index="$out.index"
+  [[ -f "$real_index" ]] && cp "$real_index" "$tmp_index"
+  GIT_INDEX_FILE="$tmp_index" git add -A >/dev/null 2>&1 || return 1
+  GIT_INDEX_FILE="$tmp_index" git diff --cached --binary "$base" >"$out" || return 1
+  rm -f "$tmp_index"
+  [[ -s "$out" ]]
+}
+
+# Upload a file as a Devin attachment; prints its URL. Uses curl directly
+# because api_request only speaks JSON and dies on failure.
+upload_attachment() {
+  local base="$1" file="$2" response http_code body url
+  response=$(curl -s -w $'\n%{http_code}' -X POST \
+    -H "Authorization: Bearer $DEVIN_API_KEY" \
+    -F "file=@$file" "$base/attachments") || { echo "upload of $file failed: curl error" >&2; return 1; }
+  http_code=$(echo "$response" | tail -1)
+  body=$(echo "$response" | sed '$d')
+  if [[ "$http_code" -lt 200 || "$http_code" -ge 300 ]]; then
+    echo "upload of $file failed: HTTP $http_code" >&2
+    return 1
+  fi
+  # v3 returns {attachment_id, name, url}; v1 returns the URL as a string
+  url=$(echo "$body" | jq -r 'if type == "object" then .url // empty else . end' 2>/dev/null) || url="$body"
+  [[ "$url" == http* ]] || { echo "upload of $file failed: no URL in response" >&2; return 1; }
+  echo "$url"
 }
 
 # ---------------------------------------------------------------------------
@@ -142,12 +209,17 @@ get_diff() {
 
 cmd_create() {
   local task="" context="" extra_tag="" api_url="${DEVIN_API_URL:-https://api.devin.ai}" org_id="${DEVIN_ORG_ID:-}" user_id="${DEVIN_USER_ID:-}"
+  local diff_mode="patch" attach_files=""
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --task)    task="$2"; shift 2 ;;
       --context) context="$2"; shift 2 ;;
       --tag)     extra_tag="$2"; shift 2 ;;
+      --attach)  [[ -f "$2" ]] || die "--attach: file not found: $2"
+                 attach_files+="$2"$'\n'; shift 2 ;;
+      --no-diff) diff_mode="none"; shift ;;
+      --inline-diff) diff_mode="inline"; shift ;;
       --api-url) api_url="$2"; shift 2 ;;
       --org-id)  org_id="$2"; shift 2 ;;
       --user-id) user_id="$2"; shift 2 ;;
@@ -159,12 +231,46 @@ cmd_create() {
   [[ -z "${DEVIN_API_KEY:-}" ]] && die "DEVIN_API_KEY is not set. Get a key at https://app.devin.ai/settings/api-keys"
   check_deps
 
+  local base
+  base=$(resolve_api_base "$api_url" "$org_id")
+
   # Gather git context (best-effort)
-  local repo="" branch="" diff=""
+  local repo="" branch="" diff="" base_sha="" patch_file=""
   if command -v git >/dev/null 2>&1 && git rev-parse --git-dir >/dev/null 2>&1; then
     repo=$(get_repo_slug || echo "")
     branch=$(get_branch)
-    diff=$(get_diff)
+    if [[ "$diff_mode" == "patch" ]] && base_sha=$(get_base_commit); then
+      PATCH_DIR=$(mktemp -d "${TMPDIR:-/tmp}/devin-handoff.XXXXXX")
+      trap cleanup EXIT
+      patch_file="$PATCH_DIR/handoff-$(echo "${branch:-local}" | tr '/' '-').patch"
+      build_patch "$base_sha" "$patch_file" || patch_file=""
+    elif [[ "$diff_mode" == "inline" ]]; then
+      diff=$(get_diff)
+    fi
+  fi
+
+  # Upload attachments. URLs are newline-separated (bash 3.2 has no safe empty arrays).
+  local attachment_urls="" url f
+  while IFS= read -r f; do
+    [[ -z "$f" ]] && continue
+    url=$(upload_attachment "$base" "$f") || die "could not upload $f"
+    attachment_urls+="$url"$'\n'
+  done <<<"$attach_files"
+
+  local patch_name="" patch_stat=""
+  if [[ -n "$patch_file" ]]; then
+    if (( $(wc -c <"$patch_file") > MAX_PATCH_BYTES )); then
+      echo "Warning: patch is over $((MAX_PATCH_BYTES / 1048576))MB; sending an inline diff instead." >&2
+      diff=$(get_diff)
+    elif url=$(upload_attachment "$base" "$patch_file"); then
+      attachment_urls+="$url"$'\n'
+      patch_name=$(basename "$patch_file")
+      patch_stat=$(git apply --stat "$patch_file" 2>/dev/null || true)
+      echo "Attached local changes as $patch_name" >&2
+    else
+      echo "Warning: patch upload failed; sending an inline diff instead." >&2
+      diff=$(get_diff)
+    fi
   fi
 
   # Build prompt
@@ -180,10 +286,28 @@ cmd_create() {
     prompt+=$'\n'"</details>"
   fi
 
+  if [[ -n "$patch_name" ]]; then
+    prompt+=$'\n\n'"<details>"$'\n'"<summary>Local changes (attached patch)</summary>"$'\n\n'
+    prompt+="My local work is attached as \`$patch_name\`: every unpushed commit, uncommitted change and untracked file since commit \`$base_sha\`. Recreate my local state before starting:"$'\n\n'
+    prompt+='```bash'$'\n'"git checkout $base_sha"$'\n'"git apply --index $patch_name"$'\n''```'$'\n\n'
+    prompt+="Then create a new branch from there for your work."$'\n'
+    [[ -n "$patch_stat" ]] && prompt+=$'\n''```'$'\n'"$patch_stat"$'\n''```'$'\n'
+    prompt+=$'\n'"</details>"
+  fi
+
   if [[ -n "$diff" ]]; then
     prompt+=$'\n\n'"<details>"$'\n'"<summary>Uncommitted local changes (diff)</summary>"$'\n\n'
     prompt+='```diff'$'\n'"$diff"$'\n''```'$'\n\n'
     prompt+="</details>"
+  fi
+
+  # v1 only recognizes attachments as standalone ATTACHMENT:"url" lines in the
+  # prompt; v3 takes them in the attachment_urls field below.
+  if [[ -n "$attachment_urls" && "$DEVIN_API_KEY" != cog_* ]]; then
+    prompt+=$'\n'
+    while IFS= read -r url; do
+      [[ -n "$url" ]] && prompt+=$'\n'"ATTACHMENT:\"$url\""
+    done <<<"$attachment_urls"
   fi
 
   # Build tags array: always include "handoff", plus optional extra tag
@@ -206,8 +330,11 @@ cmd_create() {
       '{prompt: ., title: $title, tags: '"$tags_expr"'}')
   fi
 
-  local base
-  base=$(resolve_api_base "$api_url" "$org_id")
+  if [[ -n "$attachment_urls" && "$DEVIN_API_KEY" == cog_* ]]; then
+    json=$(printf '%s' "$attachment_urls" | jq -R . | jq -s --argjson payload "$json" \
+      '$payload + {attachment_urls: map(select(. != ""))}')
+  fi
+
   local body
   body=$(api_request POST "$base/sessions" "$json")
 

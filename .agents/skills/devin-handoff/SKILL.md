@@ -43,7 +43,8 @@ From the current working directory:
 
 1. **Repo**: Run `git remote get-url origin`, extract `owner/repo`
 2. **Branch**: Run `git rev-parse --abbrev-ref HEAD`
-3. **Diff**: Run `git diff HEAD` (truncated to 100KB automatically)
+3. **Local work**: unpushed commits, uncommitted changes and untracked files
+   are uploaded automatically as a `.patch` attachment Devin applies first
 4. **Task**: The user's request, concise and specific
 5. **Context** (optional): Summarize what you've learned — files examined,
    root cause hypotheses, partial fixes
@@ -56,9 +57,14 @@ scripts/devin-handoff.sh create \
   --context "Investigated src/auth/session.py and src/auth/middleware.py. Timeout is hardcoded at 30m in session.py:42."
 ```
 
-The script auto-detects repo, branch, and diff. The `--context` flag is
-optional but helps Devin start faster. All sessions are automatically
+The script auto-detects repo and branch, and uploads your local work as a
+patch so Devin continues from exactly where you left off. The `--context` flag
+is optional but helps Devin start faster. All sessions are automatically
 tagged with `handoff`.
+
+- `--attach FILE` uploads screenshots, PDFs, logs, etc. (repeatable)
+- `--no-diff` sends no local changes (use if untracked files are sensitive)
+- `--inline-diff` puts `git diff HEAD` in the prompt instead of a patch
 
 ### 3. Report the URL and poll
 

@@ -83,7 +83,7 @@ export DEVIN_API_KEY="your-key-here"  # Get one at https://app.devin.ai/settings
 
 ## How It Works
 
-1. **Gathers git context** — repo slug, branch, uncommitted diff (truncated to 100KB)
+1. **Gathers git context** — repo slug, branch, and your local work as a `.patch` attachment
 2. **Creates a Devin session** — `POST /sessions` with your task + context
 3. **Prints the session URL** — share it with the user
 4. **(Optional) Polls** — `GET /sessions/{id}` every N seconds until Devin finishes
@@ -97,10 +97,19 @@ already knows and includes it in the session prompt:
 
 - **Repo and branch** — detected from `git remote` and `git rev-parse`, so Devin
   clones the right repo and checks out the branch you're on
-- **Uncommitted changes** — the output of `git diff HEAD` (truncated to 100KB)
-  is included, so your work-in-progress carries over instead of being lost on
-  the way to the cloud. If you have local edits you don't want sent, commit or
-  stash them before creating the session.
+- **Local work** — everything that isn't on the remote yet (unpushed commits,
+  staged and unstaged edits, untracked files, binary files) is packed into one
+  `git diff --binary` patch against the newest commit Devin can see, and
+  uploaded as a `.patch` attachment. The prompt tells Devin to `git checkout`
+  that commit and `git apply --index` the patch, so it starts from exactly
+  where you left off. Your git index is not modified. Files matched by
+  `.gitignore` are never sent; anything else untracked is, so pass `--no-diff`
+  if you have local files you don't want uploaded.
+  If the upload fails (or the patch is over 10MB), the script falls back to an
+  inline `git diff HEAD` in the prompt (truncated to 100KB), which is also
+  what `--inline-diff` does.
+- **`--attach FILE`** — any other files Devin should see: screenshots,
+  mockups, PDFs, logs. Repeat the flag for several files.
 - **`--context`** — whatever the calling agent has learned so far: files it
   examined, root-cause hypotheses, partial fixes
 
@@ -129,6 +138,11 @@ create options:
   --task      Task description for Devin (required)
   --context   Additional context (files examined, findings, partial fixes)
   --tag       Extra tag (in addition to the default "handoff" tag)
+  --attach    Upload a file (image, PDF, log, ...) for Devin; repeatable
+  --no-diff   Don't send any local changes
+  --inline-diff
+              Send uncommitted changes inline in the prompt (git diff HEAD,
+              100KB max) instead of uploading a patch
   --api-url   Devin API base URL (default: https://api.devin.ai)
   --org-id    Organization ID (required for service keys)
   --user-id   Create session as this user (service keys only)
